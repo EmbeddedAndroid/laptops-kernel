@@ -1,12 +1,12 @@
 name: kernel-deb
 
-# Cross-builds the arm64 kernel as Debian packages via the local
-# build-linux-deb composite action, which drives
-# qualcomm-linux/qcom-deb-images build-linux-deb.py (defconfig + all
-# kernel-configs/*.config fragments + bindeb-pkg).
+# Cross-builds the arm64 kernel as Debian packages using the reusable
+# EmbeddedAndroid/kbuild-deb action (defconfig + qcom-deb-images config
+# fragments + bindeb-pkg). The action clones the kernel and cross-builds;
+# this workflow just selects the inputs and publishes the results.
 #
-# Runner is allocated on demand by the cil-gha-bridge: the runs-on
-# labels map to the bridge's "generic" profile on the x86_64 xeon pool
+# Runner is allocated on demand by the cil-gha-bridge: the runs-on labels
+# map to the bridge's "generic" profile on the x86_64 xeon pool
 # (16 vCPU / 32 GB RAM / 100 GB disk).
 
 on:
@@ -31,23 +31,16 @@ jobs:
       KBUILD_BUILD_HOST: cil-gha-bridge
 
     steps:
-      # Minimal checkout: just enough to resolve the local composite
-      # action. The kernel source itself is cloned by the action's build
-      # script. Partial + sparse so we don't pull the whole tree twice.
-      - name: Checkout workflow repo (for local action)
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: .github
-          sparse-checkout-cone-mode: true
-          filter: blob:none
-          fetch-depth: 1
-
       - name: Build arm64 kernel Debian packages
         id: build
-        uses: ./.github/actions/build-linux-deb
+        uses: EmbeddedAndroid/kbuild-deb@v1
         with:
           kernel-repo: ${{ github.server_url }}/${{ github.repository }}
           kernel-ref: ${{ github.head_ref || github.ref_name }}
+          arch: arm64
+          defconfig: defconfig
+          fragments-repo: qualcomm-linux/qcom-deb-images
+          fragments: kernel-configs/*.config
 
       - name: Upload Debian packages (build artifact)
         uses: actions/upload-artifact@v4
@@ -70,7 +63,7 @@ jobs:
           name: Linux ${{ steps.build.outputs.kernelversion }} arm64 — ${{ github.ref_name }} (build ${{ github.run_number }})
           body: |
             arm64 Debian packages, cross-compiled on amd64 via
-            qcom-deb-images build-linux-deb.py.
+            EmbeddedAndroid/kbuild-deb.
 
             Config: arm64 `defconfig` + all `kernel-configs/*.config`
             fragments from qualcomm-linux/qcom-deb-images. The exact built
