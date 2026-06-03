@@ -1,13 +1,13 @@
 name: kernel-deb
 
-# Builds the arm64 defconfig kernel as Debian packages (linux-image,
-# linux-headers, linux-libc-dev) using the kernel's built-in
-# `make bindeb-pkg` target.
+# Cross-builds the arm64 kernel as Debian packages via the local
+# build-linux-deb composite action, which drives
+# qualcomm-linux/qcom-deb-images build-linux-deb.py (defconfig + all
+# kernel-configs/*.config fragments + bindeb-pkg).
 #
 # Runner is allocated on demand by the cil-gha-bridge: the runs-on
-# labels below map to the bridge's "generic" profile on the x86_64
-# xeon pool (16 vCPU / 32 GB RAM / 100 GB disk). The arm64 target is
-# produced by cross-compiling, matching the proven qcom-build path.
+# labels map to the bridge's "generic" profile on the x86_64 xeon pool
+# (16 vCPU / 32 GB RAM / 100 GB disk).
 
 on:
   push:
@@ -27,124 +27,56 @@ jobs:
     runs-on: [self-hosted, cil, 16c-32g-100g]
     timeout-minutes: 120
     env:
-      ARCH: arm64
-      CROSS_COMPILE: aarch64-linux-gnu-
       KBUILD_BUILD_USER: cil-ci
       KBUILD_BUILD_HOST: cil-gha-bridge
-      DEBIAN_FRONTEND: noninteractive
 
     steps:
-      - name: Checkout kernel tree
+      # Minimal checkout: just enough to resolve the local composite
+      # action. The kernel source itself is cloned by the action's build
+      # script. Partial + sparse so we don't pull the whole tree twice.
+      - name: Checkout workflow repo (for local action)
         uses: actions/checkout@v4
         with:
-          # Shallow: this tree has >1.4M commits; full history is huge
-          # and the build only needs the working source.
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: true
+          filter: blob:none
           fetch-depth: 1
 
-      - name: Install build dependencies
-        run: |
-          set -eux
-          sudo apt-get update -qq
-          # crossbuild-essential-arm64 pulls the aarch64 toolchain *and*
-          # libc6-dev-arm64-cross. The latter is required because the
-          # linux-headers package rebuilds its bundled host tools as
-          # arm64 (target) binaries via the cross gcc, which needs the
-          # arm64 libc headers.
-          sudo apt-get install -y --no-install-recommends \
-            crossbuild-essential-arm64 \
-            build-essential bc bison flex \
-            libssl-dev libelf-dev libdw-dev dwarves kmod cpio \
-            xz-utils gzip rsync git \
-            dpkg-dev debhelper fakeroot \
-            python3 ca-certificates
-
-      - name: Configure (arm64 defconfig + qcom-deb-images fragments)
-        env:
-          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -eux
-          # Pull every *.config fragment from qcom-deb-images/kernel-configs
-          # (main branch). Listing the directory via the contents API picks
-          # up any fragments added there later, instead of a hard-coded list.
-          mkdir -p ci-fragments
-          api="https://api.github.com/repos/qualcomm-linux/qcom-deb-images/contents/kernel-configs?ref=main"
-          curl -fsSL \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GH_API_TOKEN}" \
-            "$api" \
-            | jq -r '.[] | select(.type=="file" and (.name|endswith(".config"))) | .download_url' \
-            > frag-urls.txt
-          test -s frag-urls.txt
-          while read -r url; do
-            [ -n "$url" ] || continue
-            curl -fsSL -o "ci-fragments/$(basename "$url")" "$url"
-          done < frag-urls.txt
-          echo "==> fragments fetched:"; ls -la ci-fragments
-
-          # merge_config.sh -m merges the arm64 defconfig + all fragments
-          # into .config (text merge, no make); olddefconfig then resolves
-          # symbol dependencies and defaults for the merged set.
-          ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" \
-            ./scripts/kconfig/merge_config.sh -m \
-            arch/arm64/configs/defconfig ci-fragments/*.config
-          make -j"$(nproc)" olddefconfig
-
-      - name: Build Debian packages
-        run: |
-          set -eux
-          # KDEB_PKGVERSION must be a valid Debian version; suffix the
-          # kernel version with the CI run number for uniqueness.
-          # DPKG_FLAGS=-d skips dpkg's build-dependency check: when
-          # cross-building the host arch is arm64, so dpkg-checkbuilddeps
-          # wants arm64 libssl-dev/libdw-dev, but the cross-compile only
-          # needs the native host tools (already installed above).
-          make -j"$(nproc)" bindeb-pkg \
-            DPKG_FLAGS=-d \
-            KDEB_PKGVERSION="$(make -s kernelversion)-${GITHUB_RUN_NUMBER}"
-
-      - name: Collect .deb artifacts
-        id: collect
-        run: |
-          set -eux
-          mkdir -p out
-          # bindeb-pkg drops the packages one directory above the
-          # kernel source tree.
-          mv ../*.deb out/
-          # Publish the exact kernel config used for this build (post
-          # olddefconfig, so it reflects what was actually compiled).
-          cp -v .config "out/config-$(make -s kernelversion)-${GITHUB_RUN_NUMBER}"
-          (cd out && sha256sum *.deb config-* | tee SHA256SUMS)
-          ls -la out
-          echo "kver=$(make -s kernelversion)" >> "$GITHUB_OUTPUT"
+      - name: Build arm64 kernel Debian packages
+        id: build
+        uses: ./.github/actions/build-linux-deb
+        with:
+          kernel-repo: ${{ github.server_url }}/${{ github.repository }}
+          kernel-ref: ${{ github.head_ref || github.ref_name }}
 
       - name: Upload Debian packages (build artifact)
         uses: actions/upload-artifact@v4
         with:
           name: linux-arm64-deb
           path: |
-            out/*.deb
-            out/config-*
-            out/SHA256SUMS
+            ${{ steps.build.outputs.deb-dir }}/*.deb
+            ${{ steps.build.outputs.deb-dir }}/config-*
+            ${{ steps.build.outputs.deb-dir }}/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
 
       - name: Publish GitHub Release
         # Any branch push (skip PRs); auto-tags each build and attaches
-        # the .deb packages. Pure-API action, so no gh CLI is needed on
-        # the minimal runner image.
+        # the .deb packages plus the kernel config.
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: Linux ${{ steps.collect.outputs.kver }} arm64 — ${{ github.ref_name }} (build ${{ github.run_number }})
+          name: Linux ${{ steps.build.outputs.kernelversion }} arm64 — ${{ github.ref_name }} (build ${{ github.run_number }})
           body: |
-            arm64 Debian packages, cross-compiled on amd64.
+            arm64 Debian packages, cross-compiled on amd64 via
+            qcom-deb-images build-linux-deb.py.
 
             Config: arm64 `defconfig` + all `kernel-configs/*.config`
-            fragments from qualcomm-linux/qcom-deb-images (main). The exact
-            built `.config` is attached as `config-*`.
+            fragments from qualcomm-linux/qcom-deb-images. The exact built
+            `.config` is attached as `config-*`.
 
-            - Kernel version: `${{ steps.collect.outputs.kver }}`
+            - Kernel version: `${{ steps.build.outputs.kernelversion }}`
             - Branch: `${{ github.ref_name }}`
             - Commit: ${{ github.sha }}
             - CI run: ${{ github.run_number }}
@@ -152,7 +84,7 @@ jobs:
             SHA256 sums are in `SHA256SUMS`.
           target_commitish: ${{ github.sha }}
           files: |
-            out/*.deb
-            out/config-*
-            out/SHA256SUMS
+            ${{ steps.build.outputs.deb-dir }}/*.deb
+            ${{ steps.build.outputs.deb-dir }}/config-*
+            ${{ steps.build.outputs.deb-dir }}/SHA256SUMS
           fail_on_unmatched_files: true

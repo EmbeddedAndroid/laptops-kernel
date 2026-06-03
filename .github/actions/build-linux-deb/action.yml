@@ -1,0 +1,107 @@
+name: build-linux-deb
+description: >-
+  Configure and cross-build an arm64 Linux kernel as Debian packages using
+  qualcomm-linux/qcom-deb-images build-linux-deb.py and its kernel-config
+  fragments. Cross-compiles on an amd64 host.
+
+inputs:
+  kernel-repo:
+    description: Git URL of the kernel repository to build.
+    required: true
+  kernel-ref:
+    description: Branch or tag of the kernel repo to build (git clone --branch).
+    required: true
+  qcom-deb-images-ref:
+    description: >-
+      Ref of qualcomm-linux/qcom-deb-images to take the build script and the
+      kernel-config fragments from.
+    required: false
+    default: main
+
+outputs:
+  deb-dir:
+    description: Directory containing the built .deb packages and SHA256SUMS.
+    value: ${{ steps.collect.outputs.deb-dir }}
+  config-file:
+    description: Path to the published kernel .config used for the build.
+    value: ${{ steps.collect.outputs.config-file }}
+  kernelversion:
+    description: Output of 'make kernelversion' for the built tree.
+    value: ${{ steps.collect.outputs.kernelversion }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout qcom-deb-images (build script + config fragments)
+      uses: actions/checkout@v4
+      with:
+        repository: qualcomm-linux/qcom-deb-images
+        ref: ${{ inputs.qcom-deb-images-ref }}
+        path: qcom-deb-images
+        fetch-depth: 1
+
+    - name: Install build dependencies (arm64 cross + multiarch)
+      shell: bash
+      run: |
+        set -eux
+        export DEBIAN_FRONTEND=noninteractive
+        # build-linux-deb.py's check_dependencies() requires libssl-dev:arm64,
+        # so enable the arm64 foreign architecture. archive.ubuntu.com has no
+        # arm64; pin the stock sources to amd64 and pull arm64 from ports.
+        codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+          grep -q '^Architectures:' /etc/apt/sources.list.d/ubuntu.sources \
+            || sudo sed -i '/^Signed-By:/i Architectures: amd64' \
+                 /etc/apt/sources.list.d/ubuntu.sources
+        fi
+        if [ -s /etc/apt/sources.list ]; then
+          sudo sed -i -E 's|^deb (\[[^]]*\] )?|deb [arch=amd64] |' /etc/apt/sources.list
+        fi
+        printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports\nSuites: %s %s-updates %s-security\nComponents: main universe restricted multiverse\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+          "$codename" "$codename" "$codename" \
+          | sudo tee /etc/apt/sources.list.d/arm64-ports.sources >/dev/null
+        sudo dpkg --add-architecture arm64
+        sudo apt-get update -qq
+        # Superset of build-linux-deb.py check_dependencies().
+        sudo apt-get install -y --no-install-recommends \
+          git crossbuild-essential-arm64 make flex bison bc \
+          libdw-dev libelf-dev libssl-dev libssl-dev:arm64 \
+          dpkg-dev debhelper kmod python3 rsync coreutils \
+          cpio xz-utils gzip dwarves
+
+    - name: Configure + build (build-linux-deb.py)
+      shell: bash
+      env:
+        KERNEL_REPO: ${{ inputs.kernel-repo }}
+        KERNEL_REF: ${{ inputs.kernel-ref }}
+      run: |
+        set -eux
+        # Let the script clone the kernel into ./linux (its default dir): this
+        # sidesteps build-linux-deb.py's --local-dir cwd handling, which is
+        # hard-coded to "linux". Pass every *.config fragment from the repo.
+        python3 qcom-deb-images/scripts/build-linux-deb.py \
+          --repo "$KERNEL_REPO" --ref "$KERNEL_REF" \
+          qcom-deb-images/kernel-configs/*.config
+
+    - name: Collect outputs (.deb + .config)
+      id: collect
+      shell: bash
+      run: |
+        set -eux
+        shopt -s nullglob
+        mkdir -p out
+        # bindeb-pkg drops packages one dir above the kernel tree (./linux),
+        # i.e. the workspace root.
+        debs=( *.deb )
+        test "${#debs[@]}" -gt 0
+        mv "${debs[@]}" out/
+        kver="$(make -s -C linux kernelversion)"
+        # Publish the exact config used (captured post-olddefconfig).
+        cp -v linux/.config "out/config-${kver}-${GITHUB_RUN_NUMBER:-0}"
+        ( cd out && sha256sum *.deb config-* | tee SHA256SUMS )
+        ls -la out
+        {
+          echo "deb-dir=out"
+          echo "config-file=$(ls out/config-*)"
+          echo "kernelversion=${kver}"
+        } >> "$GITHUB_OUTPUT"
