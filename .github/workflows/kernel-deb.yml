@@ -1,0 +1,121 @@
+name: kernel-deb
+
+# Builds the arm64 defconfig kernel as Debian packages (linux-image,
+# linux-headers, linux-libc-dev) using the kernel's built-in
+# `make bindeb-pkg` target.
+#
+# Runner is allocated on demand by the cil-gha-bridge: the runs-on
+# labels below map to the bridge's "generic" profile on the x86_64
+# xeon pool (16 vCPU / 32 GB RAM / 100 GB disk). The arm64 target is
+# produced by cross-compiling, matching the proven qcom-build path.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# Needed for the release step to create the tag + release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  build-arm64-deb:
+    # [self-hosted, cil] -> cil-gha-bridge; "16c-32g-100g" is the
+    # generic-profile shape token (cpu-ram-disk). One ephemeral CIL
+    # lease per run; torn down on completion.
+    runs-on: [self-hosted, cil, 16c-32g-100g]
+    timeout-minutes: 120
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      KBUILD_BUILD_USER: cil-ci
+      KBUILD_BUILD_HOST: cil-gha-bridge
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout kernel tree
+        uses: actions/checkout@v4
+        with:
+          # Shallow: this tree has >1.4M commits; full history is huge
+          # and the build only needs the working source.
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          # crossbuild-essential-arm64 pulls the aarch64 toolchain *and*
+          # libc6-dev-arm64-cross. The latter is required because the
+          # linux-headers package rebuilds its bundled host tools as
+          # arm64 (target) binaries via the cross gcc, which needs the
+          # arm64 libc headers.
+          sudo apt-get install -y --no-install-recommends \
+            crossbuild-essential-arm64 \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev libdw-dev dwarves kmod cpio \
+            xz-utils gzip rsync git \
+            dpkg-dev debhelper fakeroot \
+            python3 ca-certificates
+
+      - name: Configure (arm64 defconfig)
+        run: make -j"$(nproc)" defconfig
+
+      - name: Build Debian packages
+        run: |
+          set -eux
+          # KDEB_PKGVERSION must be a valid Debian version; suffix the
+          # kernel version with the CI run number for uniqueness.
+          # DPKG_FLAGS=-d skips dpkg's build-dependency check: when
+          # cross-building the host arch is arm64, so dpkg-checkbuilddeps
+          # wants arm64 libssl-dev/libdw-dev, but the cross-compile only
+          # needs the native host tools (already installed above).
+          make -j"$(nproc)" bindeb-pkg \
+            DPKG_FLAGS=-d \
+            KDEB_PKGVERSION="$(make -s kernelversion)-${GITHUB_RUN_NUMBER}"
+
+      - name: Collect .deb artifacts
+        id: collect
+        run: |
+          set -eux
+          mkdir -p out
+          # bindeb-pkg drops the packages one directory above the
+          # kernel source tree.
+          mv ../*.deb out/
+          (cd out && sha256sum *.deb | tee SHA256SUMS)
+          ls -la out
+          echo "kver=$(make -s kernelversion)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Debian packages (build artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-deb
+          path: |
+            out/*.deb
+            out/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        # Any branch push (skip PRs); auto-tags each build and attaches
+        # the .deb packages. Pure-API action, so no gh CLI is needed on
+        # the minimal runner image.
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Linux ${{ steps.collect.outputs.kver }} arm64 — ${{ github.ref_name }} (build ${{ github.run_number }})
+          body: |
+            arm64 `defconfig` Debian packages, cross-compiled on amd64.
+
+            - Kernel version: `${{ steps.collect.outputs.kver }}`
+            - Branch: `${{ github.ref_name }}`
+            - Commit: ${{ github.sha }}
+            - CI run: ${{ github.run_number }}
+
+            SHA256 sums are in `SHA256SUMS`.
+          target_commitish: ${{ github.sha }}
+          files: |
+            out/*.deb
+            out/SHA256SUMS
+          fail_on_unmatched_files: true
