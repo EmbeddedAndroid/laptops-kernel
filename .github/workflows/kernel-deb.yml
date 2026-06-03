@@ -58,8 +58,36 @@ jobs:
             dpkg-dev debhelper fakeroot \
             python3 ca-certificates
 
-      - name: Configure (arm64 defconfig)
-        run: make -j"$(nproc)" defconfig
+      - name: Configure (arm64 defconfig + qcom-deb-images fragments)
+        env:
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          # Pull every *.config fragment from qcom-deb-images/kernel-configs
+          # (main branch). Listing the directory via the contents API picks
+          # up any fragments added there later, instead of a hard-coded list.
+          mkdir -p ci-fragments
+          api="https://api.github.com/repos/qualcomm-linux/qcom-deb-images/contents/kernel-configs?ref=main"
+          curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_API_TOKEN}" \
+            "$api" \
+            | jq -r '.[] | select(.type=="file" and (.name|endswith(".config"))) | .download_url' \
+            > frag-urls.txt
+          test -s frag-urls.txt
+          while read -r url; do
+            [ -n "$url" ] || continue
+            curl -fsSL -o "ci-fragments/$(basename "$url")" "$url"
+          done < frag-urls.txt
+          echo "==> fragments fetched:"; ls -la ci-fragments
+
+          # merge_config.sh -m merges the arm64 defconfig + all fragments
+          # into .config (text merge, no make); olddefconfig then resolves
+          # symbol dependencies and defaults for the merged set.
+          ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" \
+            ./scripts/kconfig/merge_config.sh -m \
+            arch/arm64/configs/defconfig ci-fragments/*.config
+          make -j"$(nproc)" olddefconfig
 
       - name: Build Debian packages
         run: |
@@ -82,7 +110,10 @@ jobs:
           # bindeb-pkg drops the packages one directory above the
           # kernel source tree.
           mv ../*.deb out/
-          (cd out && sha256sum *.deb | tee SHA256SUMS)
+          # Publish the exact kernel config used for this build (post
+          # olddefconfig, so it reflects what was actually compiled).
+          cp -v .config "out/config-$(make -s kernelversion)-${GITHUB_RUN_NUMBER}"
+          (cd out && sha256sum *.deb config-* | tee SHA256SUMS)
           ls -la out
           echo "kver=$(make -s kernelversion)" >> "$GITHUB_OUTPUT"
 
@@ -92,6 +123,7 @@ jobs:
           name: linux-arm64-deb
           path: |
             out/*.deb
+            out/config-*
             out/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
@@ -106,7 +138,11 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: Linux ${{ steps.collect.outputs.kver }} arm64 — ${{ github.ref_name }} (build ${{ github.run_number }})
           body: |
-            arm64 `defconfig` Debian packages, cross-compiled on amd64.
+            arm64 Debian packages, cross-compiled on amd64.
+
+            Config: arm64 `defconfig` + all `kernel-configs/*.config`
+            fragments from qualcomm-linux/qcom-deb-images (main). The exact
+            built `.config` is attached as `config-*`.
 
             - Kernel version: `${{ steps.collect.outputs.kver }}`
             - Branch: `${{ github.ref_name }}`
@@ -117,5 +153,6 @@ jobs:
           target_commitish: ${{ github.sha }}
           files: |
             out/*.deb
+            out/config-*
             out/SHA256SUMS
           fail_on_unmatched_files: true
