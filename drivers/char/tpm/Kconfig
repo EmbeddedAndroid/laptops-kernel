@@ -260,7 +260,7 @@ config TCG_OPTEE_DTPM
 	help
 	  This driver proxies for a discrete TPM that is owned by OP-TEE and
 	  reachable only from the secure world (for example an SPI TPM behind
-	  OP-TEE's TPM TIS driver). OP-TEE exposes a passthrough pseudo TA and
+	  OP-TEE's TPM TIS driver). OP-TEE exposes a mediator pseudo TA and
 	  this driver pipes TPM commands through it, presenting a standard
 	  TPM character device to the normal world.
 

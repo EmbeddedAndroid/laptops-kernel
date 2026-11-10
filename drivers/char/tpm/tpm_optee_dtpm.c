@@ -3,7 +3,7 @@
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  *
  * Front-end for a discrete TPM owned by OP-TEE and exposed to the normal
- * world through a passthrough pseudo TA. The chip sits on a bus only the
+ * world through a mediator pseudo TA. The chip sits on a bus only the
  * secure world can reach (e.g. an SPI TPM behind OP-TEE's TPM TIS driver);
  * this driver supplies the TA identity and binds it, the shared transport in
  * tpm_optee does the rest.
